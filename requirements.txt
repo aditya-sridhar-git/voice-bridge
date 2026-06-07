@@ -1,0 +1,47 @@
+# ============================================================
+# voice-bridge requirements
+# Emotion-Preserving Accent Conversion Pipeline
+# ============================================================
+
+# ── Stage 1: Transcription ──────────────────────────────────
+faster-whisper>=1.0.0
+silero-vad
+
+# ── Stage 2: Feature Extraction ─────────────────────────────
+speechbrain>=1.0.0
+pyannote.audio>=3.1.0
+praat-parselmouth>=0.4.3
+
+# ── Stage 3: Phonetic Rewriting ─────────────────────────────
+gruut>=2.3.0
+eng_to_ipa==0.0.2          # fallback G2P
+
+# ── Stage 4: Voice Synthesis ────────────────────────────────
+# OpenVoice v2 — install separately from GitHub:
+#   git clone https://github.com/myshell-ai/OpenVoice
+#   pip install -e OpenVoice/
+melo-tts
+
+# ── Stage 5: Prosody Transplant ─────────────────────────────
+pyworld>=0.3.4
+librosa>=0.10.0
+scipy>=1.11.0
+
+# ── Core / Shared ───────────────────────────────────────────
+numpy>=1.24.0
+torch>=2.1.0
+torchaudio>=2.1.0
+soundfile>=0.12.0
+pydub>=0.25.0
+
+# ── Existing OpenVoice dependencies ─────────────────────────
+wavmark==0.0.3
+inflect==7.0.0
+unidecode==1.3.7
+pypinyin==0.50.0
+cn2an==0.5.22
+jieba==0.42.1
+langid==1.1.6
+gradio==3.48.0
+openai
+python-dotenv
