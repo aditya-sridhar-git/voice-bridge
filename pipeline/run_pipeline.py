@@ -264,4 +264,4 @@ if __name__ == "__main__":
         verbose=True,
     )
 
-    print(f"\n✓ Output saved to: {result.output_audio}")
+    print(f"\nDone! Output saved to: {result.output_audio}")
