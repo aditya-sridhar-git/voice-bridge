@@ -11,6 +11,15 @@ Or programmatically:
     result = run_pipeline("input.wav", accent_pair="indian_american")
 """
 
+import sys
+from pathlib import Path as _Path
+# Ensure repo root is on sys.path so `pipeline.*` is importable
+# whether this file is run as `python pipeline/run_pipeline.py`
+# or imported as `from pipeline.run_pipeline import run_pipeline`.
+_REPO_ROOT = _Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import json
 import logging
 import os
@@ -106,7 +115,7 @@ def run_pipeline(
     # Stage 1 — Transcription
     # ========================================================================
     logger.info("\n── Stage 1: Transcription ──")
-    from pipeline.stage1_transcribe import transcribe
+    from pipeline.stage1_transcribe import transcribe  # noqa: E402
 
     transcript_path = str(run_dir / "stage1_transcript.json")
     transcript_result = transcribe(
@@ -127,7 +136,7 @@ def run_pipeline(
     # Stage 2 — Feature extraction
     # ========================================================================
     logger.info("\n── Stage 2: Feature Extraction ──")
-    from pipeline.stage2_features import extract_features
+    from pipeline.stage2_features import extract_features  # noqa: E402
 
     features_path = str(run_dir / "stage2_features.json")
     feature_bundle = extract_features(
@@ -141,7 +150,7 @@ def run_pipeline(
     # Stage 3 — Phonetic rewriting
     # ========================================================================
     logger.info("\n── Stage 3: Phonetic Rewriting ──")
-    from pipeline.stage3_phonetic_rewrite import rewrite_phonetics
+    from pipeline.stage3_phonetic_rewrite import rewrite_phonetics  # noqa: E402
 
     phonetic_path = str(run_dir / "stage3_phonetic.json")
     phonetic_result = rewrite_phonetics(
@@ -154,7 +163,7 @@ def run_pipeline(
     # Stage 4 — Voice synthesis
     # ========================================================================
     logger.info("\n── Stage 4: Voice Synthesis ──")
-    from pipeline.stage4_synthesize import synthesize
+    from pipeline.stage4_synthesize import synthesize  # noqa: E402
 
     synth_path = str(run_dir / "stage4_synthesized.wav")
     synthesize(
@@ -170,7 +179,7 @@ def run_pipeline(
     # Stage 5 — Prosody transplant
     # ========================================================================
     logger.info("\n── Stage 5: Prosody Transplant ──")
-    from pipeline.stage5_prosody_transplant import transplant_prosody
+    from pipeline.stage5_prosody_transplant import transplant_prosody  # noqa: E402
 
     if output_path is None:
         output_path = str(run_dir / "output.wav")
