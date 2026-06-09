@@ -1,0 +1,9 @@
+# runs/
+# Per-run intermediate outputs are stored here (not tracked in git).
+# Each run creates a subdirectory: runs/<run_id>/
+#   stage1_transcript.json
+#   stage2_features.json
+#   stage3_phonetic.json
+#   stage4_synthesized.wav
+#   output.wav
+#   pipeline_result.json

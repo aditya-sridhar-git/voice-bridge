@@ -1,0 +1,6 @@
+# models/
+# Downloaded model checkpoints are stored here (not tracked in git).
+# Sub-directories created automatically at runtime:
+#   models/speechbrain_emotion/   — SpeechBrain emotion classifier
+#   models/speechbrain_speaker/   — SpeechBrain ECAPA-TDNN speaker encoder
+#   checkpoints_v2/               — OpenVoice v2 ToneColorConverter

@@ -1,0 +1,29 @@
+__pycache__/
+.ipynb_checkpoints/
+processed
+outputs
+outputs_v2
+checkpoints
+checkpoints_v2
+trash
+examples*
+.env
+build
+*.egg-info/
+*.zip
+
+# voice-bridge pipeline
+models/speechbrain_emotion/
+models/speechbrain_speaker/
+runs/*/
+!runs/.gitkeep
+*.wav
+!resources/*.mp3
+
+# Python
+*.pyc
+*.pyo
+.Python
+env/
+venv/
+.venv/
