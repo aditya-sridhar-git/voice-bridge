@@ -79,6 +79,7 @@ def run_pipeline(
     device: str = "auto",
     run_id: Optional[str] = None,
     verbose: bool = True,
+    use_llm: bool = True,
 ) -> PipelineResult:
     """
     Run the full emotion-preserving accent conversion pipeline.
@@ -93,6 +94,7 @@ def run_pipeline(
         device:         "auto", "cuda", or "cpu".
         run_id:         Reuse an existing run directory for debugging.
         verbose:        Enable INFO logging.
+        use_llm:        Use GPT-4o mini for Stage 3 phonetic rewriting.
 
     Returns:
         PipelineResult with paths to all intermediate outputs.
@@ -158,6 +160,7 @@ def run_pipeline(
         transcript=transcript_result.transcript,
         accent_pair=accent_pair,
         output_path=phonetic_path,
+        use_llm=use_llm,
     )
 
     # ========================================================================

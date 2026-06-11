@@ -12,7 +12,9 @@ speechbrain>=1.0.0
 pyannote.audio>=3.1.0
 praat-parselmouth>=0.4.3
 
-# ── Stage 3: Phonetic Rewriting ─────────────────────────────
+# ── Stage 3: Phonetic Rewriting (LLM-powered) ───────────────
+openai>=1.0.0
+python-dotenv>=1.0.0
 gruut>=2.3.0
 eng_to_ipa==0.0.2          # fallback G2P
 
