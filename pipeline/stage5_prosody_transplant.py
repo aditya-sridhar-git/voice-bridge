@@ -69,16 +69,14 @@ def _transplant_f0(
     """
     Shift synthesized audio pitch to match the source speaker's mean pitch.
 
-    Uses RESAMPLE-based pitch correction (no phase vocoder = no metallic artifacts):
-      1. Estimate source & synth median F0
-      2. Resample audio from sr → sr * ratio  (changes pitch + duration)
-      3. Resample back to original sample count (restores duration, keeps pitch)
-
-    Formants shift proportionally with pitch — more natural than phase vocoder
-    which tries to separate them and introduces STFT phasing artifacts.
+    Uses librosa.pitch_shift with high-quality settings (bins_per_octave=48).
+    Only corrects the MEAN pitch offset between source and synth; the actual
+    pitch contour shape comes from the source audio via OpenVoice cloning.
     Clamped to ±6 semitones to prevent over-correction.
     """
     try:
+        import librosa
+
         src_f0 = np.array(source_f0, dtype=np.float64)
         voiced_src = src_f0[src_f0 > 5.0]
 
@@ -88,7 +86,7 @@ def _transplant_f0(
 
         src_mean_f0 = float(np.median(voiced_src))
 
-        # Analyse synth F0 with pyworld (analysis only — NO re-synthesis)
+        # Estimate synth mean F0 via pyworld analysis only (no re-synthesis)
         synth_mean_f0 = None
         try:
             import pyworld as pw
@@ -112,21 +110,15 @@ def _transplant_f0(
             logger.info("  Pitch difference < 0.25 semitones. No shift needed.")
             return synth_audio
 
-        logger.info(f"  Pitch shift: {n_steps:+.2f} semitones  "
-                    f"(source={src_mean_f0:.1f}Hz, synth={synth_mean_f0:.1f}Hz) "
-                    f"[resample method]")  
+        logger.info(f"  Pitch shift: {n_steps:+.2f} semitones "
+                    f"(source={src_mean_f0:.1f}Hz, synth={synth_mean_f0:.1f}Hz)")
 
-        # Resample-based pitch shift (no phase vocoder)
-        # ratio > 1 → play back faster at same duration → higher pitch
-        ratio = 2.0 ** (n_steps / 12.0)
-        original_len = len(synth_audio)
-        # Step 1: resample to pitch-shifted length
-        from scipy.signal import resample as scipy_resample
-        shifted_len = int(round(original_len / ratio))
-        pitch_shifted = scipy_resample(synth_audio, shifted_len).astype(np.float32)
-        # Step 2: resample back to original length (restores tempo, keeps pitch)
-        restored = scipy_resample(pitch_shifted, original_len).astype(np.float32)
-        return restored
+        # librosa pitch_shift: actual pitch shift without duration change
+        # bins_per_octave=48 gives 4× higher frequency resolution than default
+        shifted = librosa.effects.pitch_shift(
+            synth_audio, sr=sr, n_steps=n_steps, bins_per_octave=48
+        )
+        return shifted.astype(np.float32)
 
     except Exception as e:
         logger.warning(f"Pitch shift failed ({e}). Returning unchanged audio.")
@@ -329,46 +321,39 @@ def _match_duration(
     audio: np.ndarray,
     source_duration_s: float,
     sr: int = TARGET_SR,
-    tolerance: float = 0.05,
+    tolerance: float = 0.08,
 ) -> np.ndarray:
     """
     Time-stretch synthesized audio to match source duration.
 
-    For stretches <= 30%, uses scipy resample (no phase artifacts, natural
-    for speech). For larger mismatches, falls back to librosa phase vocoder.
-    Only applied if duration mismatch exceeds `tolerance` (default 5%).
+    Uses librosa.time_stretch which changes SPEED but PRESERVES PITCH.
+    This is critical — scipy.resample changes both speed AND pitch together,
+    which caused emotional clips (where TTS speed differs from source) to
+    sound higher or lower pitched after duration correction.
+
+    librosa.time_stretch uses STFT phase vocoder which adds mild texture
+    but keeps pitch accurate, which is the priority here.
+
+    rate = synth/source:
+      rate > 1  → speeds up (shortens) → use when synth is longer than source
+      rate < 1  → slows down (lengthens) → use when synth is shorter than source
     """
     synth_duration = len(audio) / sr
-    # rate < 1 → output is longer (slow down); rate > 1 → output is shorter (speed up)
-    # We want output_samples = source_duration * sr
-    # scipy.signal.resample(audio, n_samples) resamples to exactly n_samples
-    target_samples = int(source_duration_s * sr)
-    current_samples = len(audio)
-
-    stretch_ratio = source_duration_s / max(synth_duration, 0.01)  # > 1 = need longer
+    stretch_ratio = source_duration_s / max(synth_duration, 0.01)
 
     if abs(stretch_ratio - 1.0) < tolerance:
-        logger.debug(f"Duration mismatch {stretch_ratio:.3f}x within tolerance. Skipping stretch.")
+        logger.debug(f"Duration mismatch {stretch_ratio:.3f}x within {tolerance*100:.0f}% tolerance. Skipping.")
         return audio
 
     logger.info(f"  Duration match: {synth_duration:.2f}s → {source_duration_s:.2f}s "
                 f"({stretch_ratio:.3f}x, {'+' if stretch_ratio > 1 else ''}{(stretch_ratio-1)*100:.1f}%)")
 
     try:
-        from scipy.signal import resample as scipy_resample
-        # scipy.signal.resample resamples to exactly target_samples
-        # This changes both speed and pitch; sounds natural for <=30% changes
-        if abs(stretch_ratio - 1.0) <= 0.35:
-            stretched = scipy_resample(audio, target_samples).astype(np.float32)
-            logger.info("    (used scipy resample — pitch-transparent)")
-            return stretched
-        # Large mismatch: fall back to phase vocoder (keep pitch, change speed)
         import librosa
-        # IMPORTANT: rate = synth/source (NOT source/synth)
-        # rate > 1 → speeds up → shorter; rate < 1 → slows down → longer
+        # rate = synth/source: >1 speeds up (synth longer than source), <1 slows down
         pv_rate = synth_duration / max(source_duration_s, 0.01)
         stretched = librosa.effects.time_stretch(audio, rate=pv_rate)
-        logger.info("    (used phase vocoder — large mismatch)")
+        logger.info(f"    Pitch-preserving stretch applied (rate={pv_rate:.3f})")
         return stretched.astype(np.float32)
     except Exception as e:
         logger.warning(f"Duration matching failed ({e}). Returning unchanged audio.")

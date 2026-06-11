@@ -91,58 +91,103 @@ class FeatureBundle:
 
 def _extract_emotion(audio_path: str, device: str = "cpu", transcript: str = "") -> EmotionFeatures:
     """
-    Detect emotion using a transformers text classifier on the transcript.
-    Falls back to neutral if model unavailable or transcript is empty.
+    Detect emotion from the RAW AUDIO using a Speech Emotion Recognition (SER)
+    model — NOT from the transcript text.
 
-    Model: j-hartmann/emotion-english-distilroberta-base
-    Labels: anger, disgust, fear, joy, neutral, sadness, surprise
+    Primary model: ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition
+      - Reads the audio waveform directly
+      - Detects emotion from acoustic features: pitch variation, energy,
+        speaking rate, voice quality (harshness, breathiness)
+      - Works correctly even when the WORDS are neutral but the TONE is angry
+      - Labels: angry, calm, disgust, fearful, happy, neutral, sad, surprised
+
+    Fallback: j-hartmann/emotion-english-distilroberta-base (text-based)
+      - Only used if the audio model fails to load
+      - Will miss tone-based emotions in neutral-worded speech
     """
+    # Label mapping → internal label set
+    audio_label_map = {
+        "angry":     "angry",
+        "calm":      "neutral",
+        "disgust":   "angry",
+        "fearful":   "sad",
+        "happy":     "happy",
+        "neutral":   "neutral",
+        "sad":       "sad",
+        "surprised": "surprised",
+    }
+    text_label_map = {
+        "joy":      "happy",
+        "surprise": "surprised",
+        "anger":    "angry",
+        "sadness":  "sad",
+        "disgust":  "angry",
+        "fear":     "sad",
+        "neutral":  "neutral",
+    }
+
+    # ── Primary: audio-based SER ──────────────────────────────────────────────
+    try:
+        import soundfile as sf
+        import numpy as np
+        from transformers import pipeline as hf_pipeline
+
+        logger.info("Loading audio SER model (wav2vec2-lg-xlsr-en-speech-emotion-recognition) …")
+        ser = hf_pipeline(
+            task="audio-classification",
+            model="ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition",
+            device=0 if device == "cuda" else -1,
+        )
+
+        # Load audio as numpy array (model expects 16kHz float32)
+        audio, sr = sf.read(audio_path, dtype="float32")
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)  # stereo → mono
+
+        # Resample to 16kHz if needed
+        if sr != 16000:
+            import librosa
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+
+        result = ser({"array": audio, "sampling_rate": 16000}, top_k=1)
+        top = result[0]
+        raw_label = top["label"].lower()
+        score = float(top["score"])
+
+        label = audio_label_map.get(raw_label, "neutral")
+        logger.info(f"  Emotion detected from AUDIO: {label} ({score:.3f}) [raw={raw_label}]")
+        return EmotionFeatures(label=label, score=score, embedding=[0.0] * 256)
+
+    except Exception as e:
+        logger.warning(f"Audio SER failed ({type(e).__name__}: {e}). Falling back to text classifier.")
+
+    # ── Fallback: text-based classifier ──────────────────────────────────────
     if not transcript or not transcript.strip():
-        logger.warning("No transcript for emotion detection. Using neutral fallback.")
+        logger.warning("No transcript for text emotion fallback. Using neutral.")
         return EmotionFeatures(label="neutral", score=1.0, embedding=[0.0] * 256)
 
     try:
         from transformers import pipeline as hf_pipeline
 
-        logger.info("Loading emotion classifier (j-hartmann/emotion-english-distilroberta-base) …")
+        logger.info("Loading text emotion classifier (j-hartmann/emotion-english-distilroberta-base) …")
         classifier = hf_pipeline(
             task="text-classification",
             model="j-hartmann/emotion-english-distilroberta-base",
             top_k=1,
             device=0 if device == "cuda" else -1,
         )
-
-        # Truncate transcript to model max length (512 tokens ~ 400 words)
         text = " ".join(transcript.split()[:400])
         result = classifier(text)
-
-        # result is [[{label, score}]] with top_k=1
         top = result[0][0] if isinstance(result[0], list) else result[0]
-        label = top["label"].lower()
+        label = text_label_map.get(top["label"].lower(), "neutral")
         score = float(top["score"])
-
-        # Map to our internal label set
-        label_map = {
-            "joy": "happy",
-            "surprise": "surprised",
-            "anger": "angry",
-            "sadness": "sad",
-            "disgust": "angry",   # merge into angry
-            "fear": "sad",        # merge into sad
-            "neutral": "neutral",
-        }
-        label = label_map.get(label, label)
-
-        logger.info(f"  Emotion detected from transcript: {label} ({score:.3f})")
-        return EmotionFeatures(
-            label=label,
-            score=score,
-            embedding=[0.0] * 256,  # text-based model has no audio embedding
-        )
+        logger.info(f"  Emotion detected from TEXT: {label} ({score:.3f})")
+        return EmotionFeatures(label=label, score=score, embedding=[0.0] * 256)
 
     except Exception as e:
-        logger.warning(f"Emotion extraction failed ({e}). Using neutral fallback.")
+        logger.warning(f"Text emotion extraction also failed ({e}). Using neutral fallback.")
         return EmotionFeatures(label="neutral", score=1.0, embedding=[0.0] * 256)
+
 
 
 # ---------------------------------------------------------------------------
