@@ -67,32 +67,28 @@ def _transplant_f0(
     blend: float = 0.75,
 ) -> np.ndarray:
     """
-    Shift synthesized audio pitch to match the source speaker's mean pitch,
-    then expand the pitch variation to mirror the source's emotional range.
+    Shift synthesized audio pitch to match the source speaker's mean pitch.
 
-    Strategy (pitch-shift only — no WORLD re-synthesis, no robot artifacts):
-      1. Estimate source mean F0 from voiced frames
-      2. Estimate synth mean F0 via quick pyworld analysis (no re-synthesis)
-      3. Compute semitone difference between the two means
-      4. Apply librosa.effects.pitch_shift to shift the whole clip by that amount
-      5. Optionally expand F0 dynamics using WORLD (only if pyworld available and
-         blend > 0.5) — but this is the optional step that can be skipped
+    Uses RESAMPLE-based pitch correction (no phase vocoder = no metallic artifacts):
+      1. Estimate source & synth median F0
+      2. Resample audio from sr → sr * ratio  (changes pitch + duration)
+      3. Resample back to original sample count (restores duration, keeps pitch)
 
-    This avoids WORLD re-synthesis which is the main cause of robotic artifacts.
+    Formants shift proportionally with pitch — more natural than phase vocoder
+    which tries to separate them and introduces STFT phasing artifacts.
+    Clamped to ±6 semitones to prevent over-correction.
     """
     try:
-        import librosa
-
         src_f0 = np.array(source_f0, dtype=np.float64)
-        voiced_src = src_f0[src_f0 > 5.0]  # voiced frames only (> 5Hz)
+        voiced_src = src_f0[src_f0 > 5.0]
 
         if len(voiced_src) < 5:
             logger.warning("Too few voiced frames in source F0. Skipping pitch shift.")
             return synth_audio
 
-        src_mean_f0 = float(np.median(voiced_src))  # use median (robust to octave errors)
+        src_mean_f0 = float(np.median(voiced_src))
 
-        # Estimate synth mean F0 using pyworld (analysis only — NO re-synthesis)
+        # Analyse synth F0 with pyworld (analysis only — NO re-synthesis)
         synth_mean_f0 = None
         try:
             import pyworld as pw
@@ -109,26 +105,29 @@ def _transplant_f0(
             logger.warning("Could not estimate synth F0. Skipping pitch shift.")
             return synth_audio
 
-        # Semitone difference: how many semitones to shift synth to match source mean
         n_steps = 12.0 * np.log2(src_mean_f0 / synth_mean_f0)
-        # Clamp to ±6 semitones (half octave) to avoid over-correction
         n_steps = float(np.clip(n_steps, -6.0, 6.0))
 
-        if abs(n_steps) < 0.25:  # less than a quarter semitone — skip
+        if abs(n_steps) < 0.25:
             logger.info("  Pitch difference < 0.25 semitones. No shift needed.")
             return synth_audio
 
-        logger.info(f"  Pitch shift: {n_steps:+.2f} semitones "
-                    f"(source={src_mean_f0:.1f}Hz, synth={synth_mean_f0:.1f}Hz)")
+        logger.info(f"  Pitch shift: {n_steps:+.2f} semitones  "
+                    f"(source={src_mean_f0:.1f}Hz, synth={synth_mean_f0:.1f}Hz) "
+                    f"[resample method]")  
 
-        shifted = librosa.effects.pitch_shift(
-            synth_audio, sr=sr, n_steps=n_steps, bins_per_octave=24
-        )
-        return shifted.astype(np.float32)
+        # Resample-based pitch shift (no phase vocoder)
+        # ratio > 1 → play back faster at same duration → higher pitch
+        ratio = 2.0 ** (n_steps / 12.0)
+        original_len = len(synth_audio)
+        # Step 1: resample to pitch-shifted length
+        from scipy.signal import resample as scipy_resample
+        shifted_len = int(round(original_len / ratio))
+        pitch_shifted = scipy_resample(synth_audio, shifted_len).astype(np.float32)
+        # Step 2: resample back to original length (restores tempo, keeps pitch)
+        restored = scipy_resample(pitch_shifted, original_len).astype(np.float32)
+        return restored
 
-    except ImportError:
-        logger.warning("librosa not installed. Skipping pitch shift.")
-        return synth_audio
     except Exception as e:
         logger.warning(f"Pitch shift failed ({e}). Returning unchanged audio.")
         return synth_audio
@@ -202,7 +201,7 @@ def _amplify_emotion(
 
 
 # ---------------------------------------------------------------------------
-# 5b. Energy envelope transplant
+# 5b. Energy envelope transplant (Gaussian-smoothed gains)
 # ---------------------------------------------------------------------------
 
 def _transplant_energy(
@@ -213,13 +212,13 @@ def _transplant_energy(
     emotion_label: str = "neutral",
 ) -> np.ndarray:
     """
-    Scale audio gain frame-by-frame to match source energy envelope.
-    emotion_label adjusts the max allowable gain to boost expressiveness.
+    Scale audio gain to match source energy envelope.
+    Gains are Gaussian-smoothed across frames (sigma=5 frames ≈ 50ms) to
+    eliminate the hard 10ms jumps that cause a 'pumping' artifact.
     """
     if not source_energy_db:
         return audio
 
-    # Emotion-driven gain ceiling: expressive emotions get more headroom
     emotion_max_gain = {
         "angry":     3.5,
         "happy":     3.0,
@@ -231,40 +230,95 @@ def _transplant_energy(
 
     frame_samples = int(sr * frame_shift_ms / 1000.0)
     src_energy = np.array(source_energy_db, dtype=np.float32)
-
-    # Convert source dB → linear amplitude
     src_linear = 10.0 ** (src_energy / 20.0)
 
-    # Compute synthesized energy per frame
     n_frames = len(audio) // frame_samples
     if n_frames == 0:
         return audio
 
-    # Resample source energy to match number of synthesized frames
     if len(src_linear) != n_frames:
         indices = np.linspace(0, len(src_linear) - 1, n_frames)
         src_resampled = np.interp(indices, np.arange(len(src_linear)), src_linear)
     else:
-        src_resampled = src_linear
+        src_resampled = src_linear.copy()
 
-    output = audio.copy()
+    rms_synth = np.zeros(n_frames, dtype=np.float32)
     for i in range(n_frames):
-        start = i * frame_samples
-        end   = start + frame_samples
-        frame = audio[start:end]
+        frame = audio[i * frame_samples:(i + 1) * frame_samples]
+        rms_synth[i] = float(np.sqrt(np.mean(frame ** 2)) + 1e-8)
 
-        rms_synth = np.sqrt(np.mean(frame ** 2)) + 1e-8
-        rms_target = src_resampled[i]
+    raw_gains = np.clip(src_resampled / rms_synth, MIN_GAIN, max_gain)
 
-        gain = float(np.clip(rms_target / rms_synth, MIN_GAIN, max_gain))
-        output[start:end] = frame * gain
+    # Gaussian-smooth the gain curve to eliminate pumping
+    try:
+        from scipy.ndimage import gaussian_filter1d
+        smooth_gains = gaussian_filter1d(raw_gains, sigma=5.0)
+    except Exception:
+        smooth_gains = raw_gains
 
-    # Handle remainder
-    remainder = audio[n_frames * frame_samples:]
-    if len(remainder) > 0:
-        output[n_frames * frame_samples:] = remainder
+    # Interpolate gain to per-sample resolution for smooth transitions
+    frame_centers = (np.arange(n_frames) + 0.5) * frame_samples
+    sample_positions = np.arange(len(audio))
+    gain_curve = np.interp(sample_positions, frame_centers, smooth_gains).astype(np.float32)
 
-    return output
+    return (audio * gain_curve)
+
+
+# ---------------------------------------------------------------------------
+# 5d. Pedalboard humanisation — EQ + compression + subtle reverb
+# ---------------------------------------------------------------------------
+
+def _humanise_audio(
+    audio: np.ndarray,
+    sr: int,
+) -> np.ndarray:
+    """
+    Apply a broadcast-style post-processing chain using Spotify's pedalboard:
+
+      1. High-pass @ 80Hz   — remove sub-bass rumble (mic artifact)
+      2. Low-shelf +3dB @ 200Hz — add warmth/body
+      3. Peak cut  -4dB @ 5.5kHz — reduce harshness / synthetic brightness
+      4. High-shelf -2dB @ 8kHz  — soften the 'digital' top end
+      5. Compressor 4:1 ratio, -18dB threshold — even out dynamics
+      6. Reverb (very short room, wet=0.04) — just enough air to feel natural
+
+    All parameters are conservative to enhance naturalness without audible
+    processing artifacts.
+    """
+    try:
+        from pedalboard import (
+            Pedalboard, HighpassFilter, LowShelfFilter,
+            PeakFilter, HighShelfFilter, Compressor, Reverb
+        )
+
+        board = Pedalboard([
+            HighpassFilter(cutoff_frequency_hz=80.0),
+            LowShelfFilter(cutoff_frequency_hz=200.0, gain_db=3.0, q=0.707),
+            PeakFilter(cutoff_frequency_hz=5500.0, gain_db=-4.0, q=1.5),
+            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=-2.0, q=0.707),
+            Compressor(threshold_db=-18.0, ratio=4.0, attack_ms=5.0, release_ms=80.0),
+            Reverb(room_size=0.08, damping=0.8, wet_level=0.04, dry_level=0.96),
+        ])
+
+        # pedalboard expects (channels, samples) float32
+        audio_2d = audio[np.newaxis, :]
+        processed = board(audio_2d, sr)
+        result = processed[0].astype(np.float32)
+
+        # Re-normalize after processing
+        peak = np.abs(result).max()
+        if peak > 0.95:
+            result = result / peak * 0.95
+
+        logger.info("  5d. Pedalboard humanisation applied (EQ + compressor + reverb)")
+        return result
+
+    except ImportError:
+        logger.warning("pedalboard not installed. Skipping humanisation.")
+        return audio
+    except Exception as e:
+        logger.warning(f"Pedalboard processing failed ({e}). Skipping.")
+        return audio
 
 
 # ---------------------------------------------------------------------------
@@ -360,11 +414,11 @@ def transplant_prosody(
     src_audio, _   = _load_audio(source_audio_path)
     source_duration = len(src_audio) / sr
 
-    # 5a — Pitch shift to match source speaker's mean F0 (no WORLD re-synthesis)
+    # 5a — Pitch shift to match source speaker's mean F0 (resample method, no phase vocoder)
     logger.info("  5a. Pitch alignment …")
     audio = _transplant_f0(synth_audio, sr, source_f0, frame_shift_ms)
 
-    # 5b — Energy envelope transplant (emotion-aware gain ceiling)
+    # 5b — Energy envelope transplant (Gaussian-smoothed, no pumping)
     logger.info("  5b. Energy envelope warp …")
     audio = _transplant_energy(audio, source_energy_db, frame_shift_ms, sr,
                                emotion_label=emotion_label)
@@ -378,7 +432,10 @@ def transplant_prosody(
         logger.info("  5c. Duration rate-matching …")
         audio = _match_duration(audio, source_duration, sr)
 
-    # Normalize to prevent clipping
+    # 5d — Pedalboard humanisation: EQ + compression + subtle reverb
+    audio = _humanise_audio(audio, sr)
+
+    # Final normalize
     peak = np.abs(audio).max()
     if peak > 0.98:
         audio = audio / peak * 0.98
