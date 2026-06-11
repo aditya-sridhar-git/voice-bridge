@@ -106,12 +106,18 @@ def _transplant_f0(
         n_steps = 12.0 * np.log2(src_mean_f0 / synth_mean_f0)
         n_steps = float(np.clip(n_steps, -6.0, 6.0))
 
+        # Apply a downward pitch bias — users report output sounds too high.
+        # Subtracting 1.5 semitones intentionally places output slightly below
+        # the source median, which sounds more natural after voice cloning.
+        PITCH_BIAS = -1.5
+        n_steps = float(np.clip(n_steps + PITCH_BIAS, -6.0, 6.0))
+
         if abs(n_steps) < 0.25:
-            logger.info("  Pitch difference < 0.25 semitones. No shift needed.")
+            logger.info("  Pitch difference < 0.25 semitones after bias. No shift needed.")
             return synth_audio
 
         logger.info(f"  Pitch shift: {n_steps:+.2f} semitones "
-                    f"(source={src_mean_f0:.1f}Hz, synth={synth_mean_f0:.1f}Hz)")
+                    f"(source={src_mean_f0:.1f}Hz, synth={synth_mean_f0:.1f}Hz, bias={PITCH_BIAS:+.1f}st)")
 
         # librosa pitch_shift: actual pitch shift without duration change
         # bins_per_octave=48 gives 4× higher frequency resolution than default
@@ -133,18 +139,21 @@ def _amplify_emotion(
     audio: np.ndarray,
     sr: int,
     frame_shift_ms: int = 10,
-    expansion_ratio: float = 1.6,
-    knee_db: float = -12.0,
+    expansion_ratio: float = 2.2,
+    knee_db: float = -8.0,
 ) -> np.ndarray:
     """
     Softknee dynamic range EXPANDER.
 
     Frames louder than `knee_db` (relative to RMS mean) get boosted;
-    frames softer get attenuated. expansion_ratio=1.6 means a 10dB range
-    becomes a 16dB range — making loud syllables punchier and soft
-    inter-word gaps quieter, which perceptually amplifies emotion.
+    frames softer get attenuated.
 
-    This is the audio equivalent of turning the 'expressiveness' knob up.
+    expansion_ratio=2.2 means a 10dB range becomes a 22dB range —
+    stressed syllables hit much harder, quiet gaps drop further back.
+    knee_db=-8 means only the top 8dB of frames are below the boost
+    threshold, so more of the speech gets emotional emphasis.
+
+    Combined effect: significantly more expressive, emotional delivery.
     """
     frame_samples = max(1, int(sr * frame_shift_ms / 1000.0))
     n_frames = len(audio) // frame_samples
@@ -169,13 +178,11 @@ def _amplify_emotion(
 
         diff_db = rms_db[i] - threshold_db
         if diff_db > 0:
-            # Above threshold: boost by (ratio - 1) * diff
             gain_db = (expansion_ratio - 1.0) * diff_db
         else:
-            # Below threshold: attenuate by (ratio - 1) * diff (diff is negative)
-            gain_db = (expansion_ratio - 1.0) * diff_db * 0.5  # gentler on quiet parts
+            gain_db = (expansion_ratio - 1.0) * diff_db * 0.5
 
-        gain_db = float(np.clip(gain_db, -12.0, 12.0))  # max ±12dB adjustment
+        gain_db = float(np.clip(gain_db, -16.0, 16.0))  # raised cap for stronger emotion
         gain_linear = 10.0 ** (gain_db / 20.0)
         output[start:end] = frame * gain_linear
 
