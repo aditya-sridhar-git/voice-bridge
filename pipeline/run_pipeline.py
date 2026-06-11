@@ -174,6 +174,8 @@ def run_pipeline(
         word_durations=feature_bundle.prosody.word_durations_s,
         output_path=synth_path,
         device=device,
+        emotion_label=feature_bundle.emotion.label,
+        emotion_score=feature_bundle.emotion.score,
     )
 
     # ========================================================================
@@ -193,6 +195,7 @@ def run_pipeline(
         frame_shift_ms=feature_bundle.prosody.frame_shift_ms,
         output_path=output_path,
         match_duration=match_duration,
+        emotion_label=feature_bundle.emotion.label,
     )
 
     # ========================================================================

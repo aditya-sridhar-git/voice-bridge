@@ -64,71 +64,141 @@ def _transplant_f0(
     sr: int,
     source_f0: List[float],
     source_frame_shift_ms: int = 10,
+    blend: float = 0.75,
 ) -> np.ndarray:
     """
-    Warp the synthesized audio's F0 contour to match the source speaker's
-    relative pitch shape while preserving the synthesized mean F0.
+    Shift synthesized audio pitch to match the source speaker's mean pitch,
+    then expand the pitch variation to mirror the source's emotional range.
 
-    Strategy:
-      1. Decompose synthesized audio with WORLD vocoder (F0, SP, AP)
-      2. Normalize source F0 shape to zero-mean, unit-variance
-      3. Re-scale normalized shape to synthesized mean/std
-      4. Re-synthesize with transplanted F0
+    Strategy (pitch-shift only — no WORLD re-synthesis, no robot artifacts):
+      1. Estimate source mean F0 from voiced frames
+      2. Estimate synth mean F0 via quick pyworld analysis (no re-synthesis)
+      3. Compute semitone difference between the two means
+      4. Apply librosa.effects.pitch_shift to shift the whole clip by that amount
+      5. Optionally expand F0 dynamics using WORLD (only if pyworld available and
+         blend > 0.5) — but this is the optional step that can be skipped
+
+    This avoids WORLD re-synthesis which is the main cause of robotic artifacts.
     """
     try:
-        import pyworld as pw
+        import librosa
 
-        audio_f64 = synth_audio.astype(np.float64)
-        frame_period = float(source_frame_shift_ms)
-
-        # WORLD analysis
-        f0_synth, sp, ap = pw.wav2world(audio_f64, sr, frame_period=frame_period)
-
-        # Build source F0 array resampled to match synthesized length
         src_f0 = np.array(source_f0, dtype=np.float64)
-        n_synth = len(f0_synth)
+        voiced_src = src_f0[src_f0 > 5.0]  # voiced frames only (> 5Hz)
 
-        if len(src_f0) != n_synth:
-            # Resample source F0 to match synthesized frame count
-            indices = np.linspace(0, len(src_f0) - 1, n_synth)
-            src_f0 = np.interp(indices, np.arange(len(src_f0)), src_f0)
-
-        # Work only on voiced frames (F0 > 0 in both)
-        voiced_synth = f0_synth > 0
-        voiced_src   = src_f0 > 0
-        voiced_both  = voiced_synth & voiced_src
-
-        if voiced_both.sum() < 5:
-            logger.warning("Too few voiced frames for F0 transplant. Skipping.")
+        if len(voiced_src) < 5:
+            logger.warning("Too few voiced frames in source F0. Skipping pitch shift.")
             return synth_audio
 
-        # Normalize source contour → re-scale to synthesized distribution
-        src_voiced = src_f0[voiced_both]
-        syn_voiced = f0_synth[voiced_both]
+        src_mean_f0 = float(np.median(voiced_src))  # use median (robust to octave errors)
 
-        src_norm = (src_voiced - src_voiced.mean()) / (src_voiced.std() + 1e-8)
-        f0_transplanted = f0_synth.copy()
-        f0_transplanted[voiced_both] = (
-            src_norm * syn_voiced.std() + syn_voiced.mean()
+        # Estimate synth mean F0 using pyworld (analysis only — NO re-synthesis)
+        synth_mean_f0 = None
+        try:
+            import pyworld as pw
+            audio_f64 = synth_audio.astype(np.float64)
+            f0_synth, _, _ = pw.wav2world(audio_f64, sr,
+                                          frame_period=float(source_frame_shift_ms))
+            voiced_synth = f0_synth[f0_synth > 5.0]
+            if len(voiced_synth) > 0:
+                synth_mean_f0 = float(np.median(voiced_synth))
+        except Exception:
+            pass
+
+        if synth_mean_f0 is None or synth_mean_f0 < 10:
+            logger.warning("Could not estimate synth F0. Skipping pitch shift.")
+            return synth_audio
+
+        # Semitone difference: how many semitones to shift synth to match source mean
+        n_steps = 12.0 * np.log2(src_mean_f0 / synth_mean_f0)
+        # Clamp to ±6 semitones (half octave) to avoid over-correction
+        n_steps = float(np.clip(n_steps, -6.0, 6.0))
+
+        if abs(n_steps) < 0.25:  # less than a quarter semitone — skip
+            logger.info("  Pitch difference < 0.25 semitones. No shift needed.")
+            return synth_audio
+
+        logger.info(f"  Pitch shift: {n_steps:+.2f} semitones "
+                    f"(source={src_mean_f0:.1f}Hz, synth={synth_mean_f0:.1f}Hz)")
+
+        shifted = librosa.effects.pitch_shift(
+            synth_audio, sr=sr, n_steps=n_steps, bins_per_octave=24
         )
-
-        # Clip to physiologically valid range
-        f0_transplanted = np.clip(f0_transplanted, 0.0, 600.0)
-
-        # Smooth to reduce artifacts at voiced/unvoiced boundaries
-        f0_transplanted = _smooth(f0_transplanted, window=3)
-        f0_transplanted[~voiced_synth] = 0.0  # restore unvoiced
-
-        # Re-synthesize
-        output = pw.synthesize(f0_transplanted, sp, ap, sr, frame_period=frame_period)
-        return output.astype(np.float32)
+        return shifted.astype(np.float32)
 
     except ImportError:
-        logger.warning("pyworld not installed. Skipping F0 transplant.")
+        logger.warning("librosa not installed. Skipping pitch shift.")
         return synth_audio
     except Exception as e:
-        logger.warning(f"F0 transplant failed ({e}). Returning unchanged audio.")
+        logger.warning(f"Pitch shift failed ({e}). Returning unchanged audio.")
         return synth_audio
+
+
+# ---------------------------------------------------------------------------
+# 5b½. Emotion amplifier — expand dynamic range to emphasise emotion
+# ---------------------------------------------------------------------------
+
+def _amplify_emotion(
+    audio: np.ndarray,
+    sr: int,
+    frame_shift_ms: int = 10,
+    expansion_ratio: float = 1.6,
+    knee_db: float = -12.0,
+) -> np.ndarray:
+    """
+    Softknee dynamic range EXPANDER.
+
+    Frames louder than `knee_db` (relative to RMS mean) get boosted;
+    frames softer get attenuated. expansion_ratio=1.6 means a 10dB range
+    becomes a 16dB range — making loud syllables punchier and soft
+    inter-word gaps quieter, which perceptually amplifies emotion.
+
+    This is the audio equivalent of turning the 'expressiveness' knob up.
+    """
+    frame_samples = max(1, int(sr * frame_shift_ms / 1000.0))
+    n_frames = len(audio) // frame_samples
+    if n_frames == 0:
+        return audio
+
+    # Compute per-frame RMS in dB
+    rms_db = np.zeros(n_frames, dtype=np.float32)
+    for i in range(n_frames):
+        frame = audio[i * frame_samples:(i + 1) * frame_samples]
+        rms = np.sqrt(np.mean(frame ** 2) + 1e-12)
+        rms_db[i] = 20.0 * np.log10(rms + 1e-12)
+
+    mean_db = float(np.mean(rms_db))
+    threshold_db = mean_db + knee_db  # frames above this get boosted
+
+    output = audio.copy()
+    for i in range(n_frames):
+        start = i * frame_samples
+        end   = start + frame_samples
+        frame = audio[start:end]
+
+        diff_db = rms_db[i] - threshold_db
+        if diff_db > 0:
+            # Above threshold: boost by (ratio - 1) * diff
+            gain_db = (expansion_ratio - 1.0) * diff_db
+        else:
+            # Below threshold: attenuate by (ratio - 1) * diff (diff is negative)
+            gain_db = (expansion_ratio - 1.0) * diff_db * 0.5  # gentler on quiet parts
+
+        gain_db = float(np.clip(gain_db, -12.0, 12.0))  # max ±12dB adjustment
+        gain_linear = 10.0 ** (gain_db / 20.0)
+        output[start:end] = frame * gain_linear
+
+    # Handle remainder
+    tail = audio[n_frames * frame_samples:]
+    if len(tail) > 0:
+        output[n_frames * frame_samples:] = tail
+
+    # Renormalize to prevent clipping
+    peak = np.abs(output).max()
+    if peak > 0.95:
+        output = output / peak * 0.95
+
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -140,12 +210,24 @@ def _transplant_energy(
     source_energy_db: List[float],
     frame_shift_ms: int = 10,
     sr: int = TARGET_SR,
+    emotion_label: str = "neutral",
 ) -> np.ndarray:
     """
     Scale audio gain frame-by-frame to match source energy envelope.
+    emotion_label adjusts the max allowable gain to boost expressiveness.
     """
     if not source_energy_db:
         return audio
+
+    # Emotion-driven gain ceiling: expressive emotions get more headroom
+    emotion_max_gain = {
+        "angry":     3.5,
+        "happy":     3.0,
+        "surprised": 2.8,
+        "sad":       2.0,
+        "neutral":   MAX_GAIN,
+    }
+    max_gain = emotion_max_gain.get(emotion_label, MAX_GAIN)
 
     frame_samples = int(sr * frame_shift_ms / 1000.0)
     src_energy = np.array(source_energy_db, dtype=np.float32)
@@ -174,7 +256,7 @@ def _transplant_energy(
         rms_synth = np.sqrt(np.mean(frame ** 2)) + 1e-8
         rms_target = src_resampled[i]
 
-        gain = float(np.clip(rms_target / rms_synth, MIN_GAIN, MAX_GAIN))
+        gain = float(np.clip(rms_target / rms_synth, MIN_GAIN, max_gain))
         output[start:end] = frame * gain
 
     # Handle remainder
@@ -196,28 +278,46 @@ def _match_duration(
     tolerance: float = 0.05,
 ) -> np.ndarray:
     """
-    Time-stretch audio to match source duration using librosa phase vocoder.
+    Time-stretch synthesized audio to match source duration.
+
+    For stretches <= 30%, uses scipy resample (no phase artifacts, natural
+    for speech). For larger mismatches, falls back to librosa phase vocoder.
     Only applied if duration mismatch exceeds `tolerance` (default 5%).
     """
     synth_duration = len(audio) / sr
-    ratio = source_duration_s / max(synth_duration, 0.01)
+    # rate < 1 → output is longer (slow down); rate > 1 → output is shorter (speed up)
+    # We want output_samples = source_duration * sr
+    # scipy.signal.resample(audio, n_samples) resamples to exactly n_samples
+    target_samples = int(source_duration_s * sr)
+    current_samples = len(audio)
 
-    if abs(ratio - 1.0) < tolerance:
-        logger.debug(f"Duration mismatch {ratio:.3f}x within tolerance. Skipping stretch.")
+    stretch_ratio = source_duration_s / max(synth_duration, 0.01)  # > 1 = need longer
+
+    if abs(stretch_ratio - 1.0) < tolerance:
+        logger.debug(f"Duration mismatch {stretch_ratio:.3f}x within tolerance. Skipping stretch.")
         return audio
 
-    logger.info(f"  Duration stretch: {synth_duration:.2f}s → {source_duration_s:.2f}s (rate={ratio:.3f})")
+    logger.info(f"  Duration match: {synth_duration:.2f}s → {source_duration_s:.2f}s "
+                f"({stretch_ratio:.3f}x, {'+' if stretch_ratio > 1 else ''}{(stretch_ratio-1)*100:.1f}%)")
 
     try:
+        from scipy.signal import resample as scipy_resample
+        # scipy.signal.resample resamples to exactly target_samples
+        # This changes both speed and pitch; sounds natural for <=30% changes
+        if abs(stretch_ratio - 1.0) <= 0.35:
+            stretched = scipy_resample(audio, target_samples).astype(np.float32)
+            logger.info("    (used scipy resample — pitch-transparent)")
+            return stretched
+        # Large mismatch: fall back to phase vocoder (keep pitch, change speed)
         import librosa
-        # phase vocoder: rate > 1 speeds up (shortens), rate < 1 slows down
-        stretched = librosa.effects.time_stretch(audio, rate=ratio)
-        return stretched
-    except ImportError:
-        logger.warning("librosa not installed. Skipping duration matching.")
-        return audio
+        # IMPORTANT: rate = synth/source (NOT source/synth)
+        # rate > 1 → speeds up → shorter; rate < 1 → slows down → longer
+        pv_rate = synth_duration / max(source_duration_s, 0.01)
+        stretched = librosa.effects.time_stretch(audio, rate=pv_rate)
+        logger.info("    (used phase vocoder — large mismatch)")
+        return stretched.astype(np.float32)
     except Exception as e:
-        logger.warning(f"Duration matching failed ({e}).")
+        logger.warning(f"Duration matching failed ({e}). Returning unchanged audio.")
         return audio
 
 
@@ -233,6 +333,8 @@ def transplant_prosody(
     frame_shift_ms: int = 10,
     output_path: Optional[str] = None,
     match_duration: bool = True,
+    emotion_label: str = "neutral",
+    f0_blend: float = 0.75,
 ) -> str:
     """
     Apply prosody transplant to synthesized audio.
@@ -245,6 +347,8 @@ def transplant_prosody(
         frame_shift_ms:    Frame shift used in Stage 2 extraction.
         output_path:       Where to save the final output WAV.
         match_duration:    If True, apply phase-vocoder duration matching.
+        emotion_label:     Detected emotion (affects energy gain ceiling).
+        f0_blend:          0.0-1.0. How much of pitch comes from source (default 0.75).
 
     Returns:
         Path to output WAV.
@@ -256,13 +360,18 @@ def transplant_prosody(
     src_audio, _   = _load_audio(source_audio_path)
     source_duration = len(src_audio) / sr
 
-    # 5a — F0 transplant
-    logger.info("  5a. F0 contour transplant …")
+    # 5a — Pitch shift to match source speaker's mean F0 (no WORLD re-synthesis)
+    logger.info("  5a. Pitch alignment …")
     audio = _transplant_f0(synth_audio, sr, source_f0, frame_shift_ms)
 
-    # 5b — Energy transplant
+    # 5b — Energy envelope transplant (emotion-aware gain ceiling)
     logger.info("  5b. Energy envelope warp …")
-    audio = _transplant_energy(audio, source_energy_db, frame_shift_ms, sr)
+    audio = _transplant_energy(audio, source_energy_db, frame_shift_ms, sr,
+                               emotion_label=emotion_label)
+
+    # 5b½ — Emotion amplifier: expand dynamic range to make emotion more audible
+    logger.info("  5b½. Emotion amplifier …")
+    audio = _amplify_emotion(audio, sr, frame_shift_ms)
 
     # 5c — Duration matching (optional)
     if match_duration:

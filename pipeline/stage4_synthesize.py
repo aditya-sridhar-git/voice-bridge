@@ -77,9 +77,9 @@ def _get_speaking_rate(word_durations: dict, target_words: list) -> float:
         return 1.0
     durations = list(word_durations.values())
     avg_dur = sum(durations) / len(durations)
-    # Reference: average English syllable duration ~0.2s
-    rate = 0.2 / max(avg_dur, 0.05)
-    return float(np.clip(rate, 0.6, 1.8))
+    # Stage 5 duration-matching already handles temporal alignment.
+    # Just use natural speed here; emotion modulation is applied on top.
+    return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -92,17 +92,34 @@ def _synthesize_base(
     speed: float = 1.0,
     output_path: str = None,
     device: str = "cpu",
+    emotion_label: str = "neutral",
+    emotion_score: float = 1.0,
 ) -> str:
     """
     Synthesize text using MeloTTS with the target accent.
+    Speed is modulated by detected emotion.
     Returns path to synthesized WAV.
     """
+    # Emotion-based speed multipliers (applied on top of prosody-derived speed)
+    EMOTION_SPEED = {
+        "neutral":   1.00,
+        "happy":     1.10,
+        "angry":     1.15,
+        "sad":       0.85,
+        "surprised": 1.05,
+    }
+    emotion_mult = EMOTION_SPEED.get(emotion_label, 1.0)
+    # Blend emotion multiplier weighted by confidence score
+    blended_mult = 1.0 + (emotion_mult - 1.0) * float(emotion_score)
+    final_speed = float(np.clip(speed * blended_mult, 0.5, 2.0))
+
     try:
         from melo.api import TTS
 
         lang_key, speaker_idx = ACCENT_TO_MELOTTS.get(accent_pair, ("EN-US", 0))
 
-        logger.info(f"[Stage 4] MeloTTS: lang={lang_key}, speed={speed:.2f}")
+        logger.info(f"[Stage 4] MeloTTS: lang={lang_key}, speed={final_speed:.2f} "
+                    f"(prosody={speed:.2f} × emotion={blended_mult:.2f} [{emotion_label}])")
         model = TTS(language="EN", device=device)
         speaker_ids = model.hps.data.spk2id
 
@@ -117,7 +134,7 @@ def _synthesize_base(
             text=text,
             speaker_id=speaker_id,
             output_path=output_path,
-            speed=speed,
+            speed=final_speed,
             quiet=True,
         )
         logger.info(f"  Base TTS written to {output_path}")
@@ -165,7 +182,6 @@ def _apply_tone_color_conversion(
                 f"OpenVoice v2 checkpoint not found at {ckpt}. "
                 "Skipping tone color conversion — output is raw MeloTTS audio."
             )
-            import shutil
             shutil.copy(tts_audio_path, output_path)
             return output_path
 
@@ -175,16 +191,20 @@ def _apply_tone_color_conversion(
         )
         converter.load_ckpt(f"{ckpt}/checkpoint.pth")
 
+        # Use a temp dir so se_extractor doesn't pollute the repo root
+        import tempfile as _tf
+        processed_dir = _tf.mkdtemp(prefix="openvoice_se_")
+
         # Extract speaker style embedding from source audio
         logger.info("  Extracting source speaker style embedding …")
         target_se, _ = se_extractor.get_se(
-            source_audio_path, converter, vad=True
+            source_audio_path, converter, target_dir=processed_dir, vad=True
         )
 
         # Extract base speaker embedding from TTS audio
         logger.info("  Extracting base speaker style embedding …")
         src_se, _ = se_extractor.get_se(
-            tts_audio_path, converter, vad=False
+            tts_audio_path, converter, target_dir=processed_dir, vad=False
         )
 
         logger.info("  Running tone color conversion …")
@@ -196,19 +216,14 @@ def _apply_tone_color_conversion(
             message="@voice-bridge",
         )
 
-        logger.info(f"  Converted audio saved to {output_path}")
+        logger.info(f"  Voice-cloned audio saved to {output_path}")
         return output_path
 
-    except ImportError:
-        logger.warning(
-            "OpenVoice not installed. Skipping tone color conversion."
-        )
-        import shutil
-        shutil.copy(tts_audio_path, output_path)
-        return output_path
     except Exception as e:
-        logger.error(f"Tone color conversion failed: {e}. Using raw TTS output.")
-        import shutil
+        logger.warning(
+            f"OpenVoice tone color conversion skipped ({type(e).__name__}: {e}). "
+            "Using raw MeloTTS output."
+        )
         shutil.copy(tts_audio_path, output_path)
         return output_path
 
@@ -224,6 +239,8 @@ def synthesize(
     word_durations: Optional[dict] = None,
     output_path: Optional[str] = None,
     device: str = "auto",
+    emotion_label: str = "neutral",
+    emotion_score: float = 1.0,
 ) -> str:
     """
     Full Stage 4 synthesis: MeloTTS → ToneColorConverter.
@@ -235,6 +252,8 @@ def synthesize(
         word_durations:    Word duration map from Stage 2 (for speed matching).
         output_path:       Where to save the final synthesized WAV.
         device:            "auto", "cuda", or "cpu".
+        emotion_label:     Emotion from Stage 2 (affects TTS speed).
+        emotion_score:     Emotion confidence 0-1.
 
     Returns:
         Path to synthesized output WAV.
@@ -246,14 +265,14 @@ def synthesize(
         except ImportError:
             device = "cpu"
 
-    logger.info(f"[Stage 4] Voice synthesis (device={device})")
+    logger.info(f"[Stage 4] Voice synthesis (device={device}, emotion={emotion_label})")
 
     # Determine speaking rate from source prosody
     words = transcript.split()
     speed = _get_speaking_rate(word_durations or {}, words)
-    logger.info(f"  Speaking rate: {speed:.2f}x")
+    logger.info(f"  Base speaking rate: {speed:.2f}x")
 
-    # Step 1: MeloTTS base synthesis
+    # Step 1: MeloTTS base synthesis (with emotion-modulated speed)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tts_path = tmp.name
 
@@ -263,6 +282,8 @@ def synthesize(
         speed=speed,
         output_path=tts_path,
         device=device,
+        emotion_label=emotion_label,
+        emotion_score=emotion_score,
     )
 
     # Step 2: Tone color conversion
